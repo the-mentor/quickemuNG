@@ -1,0 +1,394 @@
+#!/usr/bin/env pwsh
+Param (
+    [Parameter(Position = 0)]$OS,
+    [Parameter(Position = 1)]$RELEASE
+)
+
+$LocalJson = '{
+    "Version":"2021.10.14.0",
+    "OSs": {
+        "Ubuntu":{
+            "APIURL": "",
+            "BaseURL":"",
+            "Flavors": [
+                "ubuntu-budgie",
+                "ubuntu-kylin",
+                "ubuntu-mate",
+                "ubuntu-studio",
+                "xubuntu",
+                "lubuntu",
+                "kubuntu"
+            ],
+            "Releases": [
+                "bionic",
+                "focal",
+                "hirsute",
+                "impish",
+                "devel"
+            ]
+        },
+        "Fedora":{
+            "APIURL": "http://getfedora.com/releases.json",
+            "BaseURL":"",
+            "Flavors": [
+                "Workstation",
+                "Spins"
+            ],
+            "Releases": [
+                "33",
+                "34"
+            ]
+        },
+        "PopOS": {
+            "APIURL": "http://api.pop-os.org/builds/",
+            "BaseURL":"",
+            "Flavors": [],
+            "Releases": [
+                "21.04",
+                "34"
+            ]
+        },
+        "Windows":{
+            "APIURL": "getfedora.com/releases.json",
+            "BaseURL":"base",
+            "Flavors": [],
+            "Releases": [
+                "8",
+                "10",
+                "11"
+            ]
+        }
+    }
+}'
+
+function Get-Flavors {
+    $OSs.PSObject.Properties.Name | foreach {
+        $OS = $_
+        $OSs.$OS.Flavors | foreach {
+            [PSCustomObject]@{
+                OS     = $OS.ToLower()
+                Flavor = $_.tolower()
+            }
+        }
+    }
+}
+
+function Make-VMDir {
+    Param(
+        $VM_PATH
+    )
+
+    If (!$(Test-Path $VM_PATH)) {
+        Write-Host "Creating VM Folder: $VM_PATH"
+        New-Item -ItemType Directory -Path $VM_PATH | Out-Null
+    }
+}
+
+function Check-FileHash {
+    Param(
+        $Algorithm = "SHA256" ,
+        $ISO_PATH,
+        $Hash
+    )
+    Write-Host "Checking File Hash ..."
+    $FileHash = Get-FileHash -Path $ISO_PATH -Algorithm $Algorithm
+    if($FileHash.Hash -eq $Hash){
+        Write-Host "Hash is correct !!" -ForegroundColor Green
+    }
+    else {
+        throw "Hash is incorrect please try again ..."
+    }
+}
+
+function Get-Ubuntu {
+    Param (
+        $OSInfo,
+        $OS,
+        $Release,
+        $DEVEL = "daily-live",
+        $VM_PATH
+    )
+   
+    # Write-Host $OS $Flavor
+    if ($OS -in @("kubuntu", "lubuntu", "ubuntu", "ubuntu-budgie", "ubuntu-mate", "xubuntu")) {
+        $PROJECT = $OS
+    }
+    elseif ($OS -eq 'ubuntu-kylin') { $PROJECT = "ubuntukylin" }
+    elseif ($OS -eq 'ubuntustudio') { $PROJECT = "ubuntustudio"; $DEVEL = "dvd" }
+    elseif ($OS -eq 'ubuntu-kylin') { $PROJECT = "ubuntukylin"; }
+
+    if ($Release -eq 'devel') {
+        $URL = "http://cdimage.ubuntu.com/${PROJECT}/${DEVEL}/current"
+    }
+    elseif ($OS -eq 'ubuntu') {
+        $URL = "http://releases.ubuntu.com/$RELEASE"
+    }
+    else {
+        $URL = "http://cdimage.ubuntu.com/$PROJECT/releases/$RELEASE/release"
+    }
+
+    Make-VMDir -VM_PATH $VM_PATH 
+
+    Write-Host "Downloading SHA256SUMS..."
+    $SHA256_Path = Join-Path -Path $VM_PATH -ChildPath SHA256SUMS
+    Write-Host "SHA256_Path: $SHA256_Path"
+    Invoke-WebRequest -Uri "$URL/SHA256SUMS" -OutFile "$SHA256_Path"
+
+    $ISO = (($(Get-Content $SHA256_Path | Select-String -Pattern 'desktop' | Select-String -Pattern 'amd64') -split ' ')[-1] -replace '\*', '')
+    $SHA256 = ($(Get-Content $SHA256_Path | Select-String -Pattern 'amd64') -split ' ')[0]
+    Write-Host $SHA256
+    $ISO_URL = "$URL/$ISO"
+
+    $ISO_PATH = Download-ISO -ISO_URL $ISO_URL -VM_PATH $VM_PATH -ISO $ISO
+
+    Check-FileHash -Algorithm SHA256 -ISO_PATH $ISO_PATH -Hash $SHA256
+   
+    Make-VMConfig -IMAGE_FILE $ISO
+}
+
+function Get-PopOS {
+    Param (
+        $OSInfo,
+        $OS,
+        $Release,
+        $VM_PATH
+    )
+    
+    $APIURL = "$($OSInfo.APIURL)/$RELEASE/intel"
+    $ReleaseInfo = Invoke-RestMethod -Uri $APIURL
+    $ISO_URL = $ReleaseInfo.URL
+    $ISO = ($ISO_URL -split '/')[-1]
+    $SHA256 = $ReleaseInfo.SHA_SUM
+    
+    Make-VMDir -VM_PATH $VM_PATH 
+
+    Write-Host $SHA256
+    $ISO_PATH = Download-ISO -ISO_URL $ISO_URL -VM_PATH $VM_PATH -ISO $ISO
+
+    Check-FileHash -Algorithm SHA256 -ISO_PATH $ISO_PATH -Hash $SHA256
+   
+    Make-VMConfig -IMAGE_FILE $ISO
+}
+
+function Get-Fedora {
+    Param (
+        $OSInfo,
+        $OS,
+        $Release,
+        $VM_PATH
+    )
+   
+    $APIURL = "$($OSInfo.APIURL)"
+    $ReleaseInfo = $(Invoke-RestMethod -Uri $APIURL) | Where-Object {$_.Variant -eq 'Workstation' -and $_.Version -eq $Release -and $_.Arch -match 'x86_64'}
+    $ISO_URL = $ReleaseInfo.Link
+    $ISO = ($ISO_URL -split '/')[-1]
+    $SHA256 = $ReleaseInfo.SHA256
+    
+    Make-VMDir -VM_PATH $VM_PATH 
+
+    Write-Host $SHA256
+    $ISO_PATH = Download-ISO -ISO_URL $ISO_URL -VM_PATH $VM_PATH -ISO $ISO
+
+    Check-FileHash -Algorithm SHA256 -ISO_PATH $ISO_PATH -Hash $SHA256
+   
+    Make-VMConfig -IMAGE_FILE $ISO
+}
+
+function Download-ISO {
+    Param (
+        $ISO_URL,
+        $VM_PATH,
+        $ISO
+    )
+
+    $ISO_Path = Join-Path -Path $VM_PATH -ChildPath $(($ISO).ToLower())
+
+    Write-Host "Downloading $ISO_URL to $ISO_PATH ..."
+
+    if ($IsLinux) {
+        Write-Host "Starting wget download ..."
+        #"wget --quiet --continue --show-progress --progress=bar:force:noscroll '$ISO_URL' -O '$ISO_Path'" 
+        wget --quiet --continue --show-progress --progress=bar:force:noscroll "$ISO_URL" -O "$ISO_PATH"
+    }
+    else {
+        #.\wget --quiet --continue --show-progress --progress=bar:force:noscroll "$ISO_URL" -O "$ISO_Path"    
+    }
+    
+    return $ISO_PATH
+}
+
+function Make-VMConfig {
+    Param (
+        $IMAGE_FILE
+    )
+
+    $IMAGE_FILE = $IMAGE_FILE.ToLower()
+
+    if ($OS -eq 'freebsd') {
+        $GUEST = "freebsd"
+        $IMAGE_TYPE = "iso"
+    }
+    elseif ($OS -match 'Ubuntu|Fedora|PopOS|Manjaro') {
+        $GUEST = "linux"
+        $IMAGE_TYPE = "iso"
+    }
+    elseif ($OS -eq 'Windows') {
+        $GUEST = "windows"
+        $IMAGE_TYPE = "iso"
+    }
+
+    $Config_Path = Join-Path -Path $PSScriptRoot -ChildPath "$OS-$RELEASE.conf"
+
+    if (!(Test-Path -Path  "$OS-$RELEASE.conf")) {
+        Write-Host "Making VM configuration for $OS-$RELEASE ..."
+        $config = @"
+guest_os="$GUEST"
+disk_img="$VM_PATH/disk.qcow2"
+$IMAGE_TYPE="$VM_PATH/$IMAGE_FILE"
+"@
+        
+        # if [ -n "${ISO_FILE}" ]; then
+        #     echo "fixed_iso=\"${VM_PATH}/${ISO_FILE}\"" >> "${OS}-${RELEASE}.conf"
+        # fi
+        
+        if($OS -match 'macos'){
+            #echo "macos_release=\"${RELEASE}\"" >> "${OS}-${RELEASE}.conf"
+        }
+        
+        # Enable TPM for Windows 11
+        if($OS -eq 'windows' -and $RELEASE -ge 11){
+            #echo "tpm=\"on\"" >> "${OS}-${RELEASE}.conf"
+        }
+        
+        Set-Content -Path $Config_Path -Value $config -Force
+    }
+    <#
+    local IMAGE_FILE=""
+    local ISO_FILE=""
+    local IMAGE_TYPE=""
+    local GUEST=""
+    IMAGE_FILE="${1}"
+    ISO_FILE="${2}"
+    if [[ "${OS}" == "freebsd" ]]; then
+        GUEST="freebsd"
+        IMAGE_TYPE="iso"
+    elif [[ "${OS}" == *"ubuntu"* ]]; then
+        GUEST="linux"
+        IMAGE_TYPE="iso"
+    elif [ "${OS}" == "macos" ]; then
+        GUEST="macos"
+        IMAGE_TYPE="img"
+    elif [ "${OS}" == "windows" ]; then
+        GUEST="windows"
+        IMAGE_TYPE="iso"
+    fi
+
+    if [ ! -e "${OS}-${RELEASE}.conf" ]; then
+        echo "Making VM configuration for ${OS}-${RELEASE}..."
+        cat << EOF > "${OS}-${RELEASE}.conf"
+guest_os="${GUEST}"
+disk_img="${VM_PATH}/disk.qcow2"
+${IMAGE_TYPE}="${VM_PATH}/${IMAGE_FILE}"
+EOF
+        if [ -n "${ISO_FILE}" ]; then
+            echo "fixed_iso=\"${VM_PATH}/${ISO_FILE}\"" >> "${OS}-${RELEASE}.conf"
+        fi
+
+        if [ "${OS}" == "macos" ]; then
+            echo "macos_release=\"${RELEASE}\"" >> "${OS}-${RELEASE}.conf"
+        fi
+
+        # Enable TPM for Windows 11
+        if [ "${OS}" == "windows" ] && [ ${RELEASE} -ge 11 ]; then
+            echo "tpm=\"on\"" >> "${OS}-${RELEASE}.conf"
+        fi
+    fi
+#>
+
+}
+
+function Start-VMInfo {
+    Write-Host
+    Write-Host "To start your $OS $RELEASE virtual machine run:"
+    Write-Host "    quickemu --vm $OS-$RELEASE.conf"
+    Write-Host
+}
+
+########## MAIN 
+
+$LocalData = $LocalJson | ConvertFrom-Json
+$OSs = $LocalData.OSs
+Write-Host "Distro Data Version: $($LocalData.Version)"
+
+#$OS = 'Kubuntu'
+#$RELEASE = 'bionic'
+
+#$OS = 'ubuntu-mate'
+#$RELEASE = 'bionic'
+#$RELEASE = 'devel'
+
+#$OS = 'Fedora'
+#$RELEASE = '33'
+
+if ($OS) { $OS = $OS.ToLower() }
+if ($RELEASE -and $RELEASE.GetType().Name -match 'string') { $RELEASE = $RELEASE.ToLower() }
+
+$Flavors = Get-Flavors
+
+if ($OS -notin $OSs.PSObject.Properties.Name) {
+    if ($OS -in $Flavors.Flavor) {
+        $Flavor = ($Flavors | Where-Object { $_.Flavor -eq $OS }).Flavor
+        $OS = ($Flavors | Where-Object { $_.Flavor -eq $OS }).OS
+    }
+    else {
+        Write-host "ERROR! You must specify an OS:"
+        $OSOptions = $OSs.PSObject.Properties.Name
+        #$OSOptions += $Flavors.Flavor
+        $OSOptions | Sort-Object 
+        break
+    } 
+}
+
+if ($RELEASE -notin $OSs.$OS.Releases) {
+    Write-Host "ERROR! You must specify a OS release name."
+    $OSs.$OS.Releases
+    break
+}
+
+#Set VM_Path 
+if ($Flavor) {
+    $VM_PATH = Join-Path -Path $PSScriptRoot -ChildPath "$Flavor-$RELEASE"
+    $OS = $Flavor
+}
+else {
+    $VM_PATH = Join-Path -Path $PSScriptRoot -ChildPath "$OS-$RELEASE"
+}
+
+Write-host "VM_PATH: $VM_PATH"
+
+switch -Wildcard ($OS) {
+    "*Ubuntu*" {
+        Write-Host "DO UBUNTU DOWNLOAD THINGS :D"
+        Get-Ubuntu -OSInfo $OSs.$OS -OS $OS -Release $Release -VM_PATH $VM_PATH
+        
+        Start-VMInfo
+    }
+    "Fedora" {
+        Write-Host "DO FEDORA DOWNLOAD THINGS :D"
+        Get-Fedora -OSInfo $OSs.$OS -OS $OS -Release $Release -VM_PATH $VM_PATH
+        Start-VMInfo
+    }
+    "PopOS" {
+        Write-Host "DO PopOS DOWNLOAD THINGS :D"
+        Get-PopOS -OSInfo $OSs.$OS -OS $OS -Release $Release -VM_PATH $VM_PATH
+        Start-VMInfo
+    }
+    "Manjaro" {
+        Write-Host "DO Manjaro DOWNLOAD THINGS :D"
+        #Get-PopOS -OSInfo $OSs.$OS -OS $OS -Release $Release -VM_PATH $VM_PATH
+        #Start-VMInfo
+    }
+    default {
+        Write-Host "Incorrect OS was specified"
+    }
+}
