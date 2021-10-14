@@ -4,6 +4,8 @@ Param (
     [Parameter(Position = 1)]$RELEASE
 )
 
+if(!$PSScriptRoot){$PSScriptRoot = $pwd}
+
 $LocalJson = '{
     "Version":"2021.10.14.0",
     "OSs": {
